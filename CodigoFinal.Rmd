@@ -1,0 +1,697 @@
+---
+title: "TFG - Julio Enciso Monfort"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = T, message = F,warning = F)
+```
+
+# Carga de librerías
+
+```{r librerias}
+pacman::p_load("readr","tidyverse","kableExtra","tm","rvest","tidytext","sentimentr","syuzhet","quanteda","spatstat","spdep","urbanmapr","corrplot","xgboost","treeshap","caret","pROC","flextable","officer","naivebayes","forecast","yardstick","broom","randomForest")
+```
+
+# Carga de datos
+```{r datos}
+datos <- read_csv("gunviolence.csv")
+datos$state <- as.factor(datos$state)
+datos$año <- substr(datos$date, 0,4)
+datos$mes <- substr(datos$date, 6,7)
+summary(as.factor(datos$año))
+```
+
+# Análisis exploratorio de datos (AED)
+
+## Mapa inicial
+```{r mapa_ini}
+mapa_usa <- map_data("usa")
+
+ggplot() +
+  geom_polygon(data = mapa_usa, aes(x = long, y = lat, group = group), fill = "white", color = "black") +
+  geom_point(data = datos, aes(x = longitude, y = latitude), color = "red", size = 1, alpha = 0.5) +
+  labs(x = "", y = "", title = "")+
+  coord_cartesian(xlim = c(-130, -65), ylim = c(24, 50))+
+  theme_void()
+```
+
+## Distribución por meses y años
+```{r meses_años}
+gun_violence_02 <- datos %>% filter(año > 2013)%>% 
+  group_by(año, mes) %>% 
+  summarize(total_incidents = n()) %>% 
+  arrange(- total_incidents)
+gun_viz_02 <- gun_violence_02 %>% 
+  ggplot(aes(mes, total_incidents, color = año)) +
+  geom_line(aes(group = año), lwd = 1) + geom_point(size = 2) + 
+  ylab("Número de incidentes")+
+  ylim(c(0,6000))+
+  theme_bw()
+gun_viz_02
+```
+
+## Días con más muertes
+```{r dias_muertes}
+dia <- datos %>% group_by(date)%>%summarise(muertes = sum(n_killed))%>%select(date,muertes)
+colnames(dia)[1] <- "fecha"
+dia$fecha <- format(dia$fecha, "%d/%m/%Y")
+head(arrange(dia,desc(muertes)),5)%>%kbl(caption = "<b> <font color='black'> Tabla 1: Días con mayor número de muertes</font> <b>")%>%
+  kable_styling(position = "float_left")
+```
+
+## Días con más incidentes
+```{r dias_incid}
+dia2 <- datos %>% group_by(date)%>%summarise(incidentes = n())%>%select(date,incidentes)
+colnames(dia2)[1] <- "fecha"
+dia2$fecha <- format(dia2$fecha, "%d/%m/%Y")
+head(arrange(dia2,desc(incidentes)),5)%>%kbl(caption = "<b> <font color='black'> Tabla 2: Días con mayor número de incidentes</font> <b>")%>%
+  kable_styling(position = "float_left")
+
+```
+
+## Género y tipo
+```{r gen_tip}
+expand_participant_info <- function(column_name, df) {
+  df %>%
+    select(incident_id, !!sym(column_name)) %>%
+    mutate(row_id = row_number()) %>%
+    filter(!(is.na(!!sym(column_name)))) %>%
+    separate_rows(!!sym(column_name), sep = "\\|\\|") %>%
+    separate(!!sym(column_name), into = c("participant_id", column_name), sep = "::", fill = "right") %>%
+    mutate(participant_id = as.integer(participant_id),
+           !!sym(column_name) := ifelse(is.na(!!sym(column_name)), NA, !!sym(column_name))) %>%
+    arrange(row_id, participant_id)
+}
+
+vbles <- datos %>% select(starts_with("participant_")) %>% names()
+vbles_exp <- list()
+
+vbles_exp <- lapply(vbles, function(col) expand_participant_info(col, datos))
+df_long <- reduce(vbles_exp, 
+                  full_join, by = c("incident_id", "participant_id", "row_id")) %>%
+  select(-row_id) %>%
+  arrange(incident_id, participant_id)
+
+df_long <- df_long[!is.na(df_long$participant_id),]
+
+df_long$participant_age <- as.numeric(df_long$participant_age)
+edad_errores <- df_long %>%filter(participant_age > 150)
+# Existen dos observaciones con errores de imputación en la edad
+df_long$participant_age[df_long$participant_age == 209] <- 33
+df_long$participant_age[df_long$participant_age == 311] <- 31
+
+df_long$participant_gender <- as.factor(df_long$participant_gender)
+levels(df_long$participant_gender)
+
+df_long$participant_gender[df_long$participant_gender == "Male, female"] <- "Female"
+df_long <- droplevels(df_long)
+
+
+tabla_genero_tipo <- df_long %>%
+  group_by(participant_gender, participant_type) %>%  # Agrupar por género y tipo de participante
+  summarise(Count = n()) %>%  # Contar el número de ocurrencias en cada combinación de género y tipo
+  pivot_wider(names_from = participant_type, values_from = Count, names_prefix = "N_")
+
+tabla_genero_tipo <- tabla_genero_tipo[1:2,]
+colnames(tabla_genero_tipo) <- c("","Sospechoso","Víctima")
+
+
+tabla_genero_tipo%>%kbl(caption = "<b> <font color='black'> Tabla 3: Distribución de participantes por género y tipo</font> <b>")%>%
+  kable_classic(full_width = F, html_font = "Cambria")
+```
+
+## Edad participantes
+
+```{r edad_part}
+
+hist(df_long$participant_age, main = "", ylab = "Frecuencia",xlab = "Edad")
+```
+
+## Correlaciones
+
+```{r correlaciones}
+victimas <- df_long %>%
+  filter(participant_type == "Victim") %>%
+  group_by(incident_id) %>%
+  summarise(mean_age_victimas = mean(participant_age,na.rm = TRUE),
+            percent_male_vict = sum(participant_gender == "Male")/n() *100,
+            percent_female_vict = sum(participant_gender == "Female")/n() *100,
+            percent_killed_vict = sum(participant_status == "Killed")/n() *100,
+            percent_injured_vict = sum(participant_status == "Injured")/n() *100,
+            percent_unharmed_vict = sum(participant_status == "Unharmed")/n() *100,
+            num_vict = n())
+
+
+suspects <- df_long %>%
+  filter(participant_type == "Subject-Suspect") %>%
+  group_by(incident_id) %>%
+  summarise(mean_age_suspects = mean(participant_age,na.rm = TRUE),
+            percent_male_susp = sum(participant_gender == "Male")/n() *100,
+            percent_female_susp = sum(participant_gender == "Female")/n() *100,
+            percent_killed_susp = sum(participant_status == "Killed")/n() *100,
+            percent_injured_susp = sum(participant_status == "Injured")/n() *100,
+            percent_unharmed_susp = sum(participant_status == "Unharmed")/n() *100,
+            num_susp = n())
+
+
+datos_wide <- datos%>%left_join(victimas, by = "incident_id")%>%
+  left_join(suspects,by = "incident_id")
+datos_wide$num_part <- rowSums( datos_wide[,c("num_vict", "num_susp")], na.rm = T)
+cor(datos_wide$n_killed, datos_wide$mean_age_suspects,use = "complete.obs")
+cor(datos_wide$n_killed, datos_wide$mean_age_victimas,use = "complete.obs")
+cor(datos_wide$n_killed, datos_wide$num_part, use = "complete.obs")
+```
+
+## Análisis de texto
+
+### Términos frecuentes
+```{r terminosfrec}
+set.seed(123)  
+datoss <- subset(datos, ! is.na(datos$notes))
+datoss <- datoss[sample(nrow(datoss), nrow(datoss)*0.25), ]
+
+datoss$notes <- tolower(datoss$notes)
+# Tokenización
+corpus <- Corpus(VectorSource(datoss$notes))
+corpus <- tm_map(corpus, content_transformer(tolower))
+corpus <- tm_map(corpus, removePunctuation)
+corpus <- tm_map(corpus, removeNumbers)
+corpus <- tm_map(corpus, removeWords, stopwords("en"))
+
+# Paso 3: Contar la frecuencia de términos
+tdm <- TermDocumentMatrix(corpus)
+m <- as.matrix(tdm)
+term_frequency <- rowSums(m)
+term_frequency <- sort(term_frequency, decreasing = TRUE)
+
+
+barplot(term_frequency[1:20], las=2, col="lightblue", main="", xlab="", ylab="Frecuencia",horiz = T)
+```
+
+### Análisis de sentimientos y de polaridad
+
+```{r sent_polar}
+nrc_sp2 <- get_sentiment_dictionary(dictionary = "nrc",language = "english") %>% 
+  filter(!sentiment %in% c("positive","negative")) %>% 
+  distinct()
+nrc_sp2$word <- tolower(nrc_sp2$word)
+
+
+lista_duplicados2 <- nrc_sp2 %>% 
+  count(word,sort = TRUE) %>% 
+  filter(n>1) %>% 
+  pull(word)
+
+nrc_sp2 <- nrc_sp2 %>% 
+  filter(!word %in% lista_duplicados2)
+
+
+notas <- datos[,c(1,19)]
+notas$notes <- tolower(notas$notes)
+
+
+tidy_notes <- notas %>% 
+  unnest_tokens(word,notes) %>% 
+  tibble()
+
+
+emociones <- tidy_notes %>% 
+  inner_join(nrc_sp2) %>%
+  group_by(incident_id,sentiment) %>% 
+  summarise(total=n())
+
+emociones2 <- emociones%>%group_by(sentiment)%>%summarise(total = sum(total))
+colnames(emociones2) <- c("Sentimiento","Total")
+arrange(emociones2, desc(Total))%>%kbl()%>%
+  kable_styling(position = "float_left")
+
+
+
+
+trust_words <- filter(nrc_sp2, sentiment == "trust") 
+
+trust_words_in_text <- tidy_notes %>%
+  semi_join(trust_words, by = "word")
+
+trust_words_count <- trust_words_in_text %>%
+  count(word, sort = TRUE)
+head(trust_words_count, 5)
+
+corpus <- corpus(na.omit(datos$notes))
+
+
+related <- kwic(corpus, "related", valuetype = "glob", window = 3)
+set.seed(23)
+related[sample(nrow(related), 5, replace = F)]
+
+
+
+anger_words <- filter(nrc_sp2, sentiment == "anger") 
+
+anger_words_in_text <- tidy_notes %>%
+  semi_join(anger_words, by = "word")
+
+anger_words_count <- anger_words_in_text %>%
+  count(word, sort = TRUE)
+head(anger_words_count, 5)
+
+
+fear_words <- filter(nrc_sp2, sentiment == "fear") 
+
+fear_words_in_text <- tidy_notes %>%
+  semi_join(fear_words, by = "word")
+
+fear_words_count <- fear_words_in_text %>%
+  count(word, sort = TRUE)
+head(fear_words_count, 5)
+
+
+
+# Análisis de polaridad
+
+nrc_sp <- get_sentiment_dictionary(dictionary = "nrc",language = "english") %>% 
+  filter(sentiment %in% c("positive","negative")) %>% 
+  distinct()
+nrc_sp$word <- tolower(nrc_sp$word)
+
+
+lista_duplicados <- nrc_sp %>% 
+  count(word,sort = TRUE) %>% 
+  filter(n>1) %>% 
+  pull(word)
+
+nrc_sp <- nrc_sp %>% 
+  filter(!word %in% lista_duplicados)
+
+
+polaridad <- tidy_notes %>% 
+  inner_join(nrc_sp) %>%
+  group_by(incident_id,sentiment) %>% 
+  summarise(total=n())
+
+
+polaridad_notes <- polaridad%>%group_by(sentiment)%>%summarise(total = n())
+polaridad_notes
+
+
+```
+
+# Análisis espacial
+
+## CSR
+```{r csr}
+bbox <- owin(c(-125.0, -66.96466), c(24.396308, 49.384358))
+datos_ppp <- ppp(datos$longitude, datos$latitude, marks = datos, window = bbox)
+
+(Q <- quadratcount(datos_ppp, nx = 4, ny = 3))
+
+plot(Q)
+quadrat.test(Q)
+# Clara evidencia de un patrón espacial
+
+quadrat.test(Q, alternative = "clustered")
+```
+
+## Autocorrelación local
+
+```{r local}
+estados <- get_urbn_map(map = "states", sf = TRUE)
+st_crs(estados) <- 2813
+
+
+datos_est <- left_join(estados, datos, by = c("state_name" = "state"))
+
+datos_pr <- datos%>%group_by(state)%>%summarise(muertos = sum(n_killed))
+estados <- left_join(estados, datos_pr, by = c("state_name" = "state"))
+Pop_States <- read_csv("Pop_States.csv")
+colnames(Pop_States) <- c("state", "Population")
+estados <- left_join(estados, Pop_States, by = c("state_name" = "state"))
+estados$tasa_muertos <- estados$muertos*(100000/estados$Population)
+
+
+
+(wr <- spdep::poly2nb(estados, queen = F))
+xy <- st_centroid(estados$geometry)
+ww <- nb2listw(wr, style = "W", zero.policy = T)
+
+moran.test(estados$muertos, list = ww, zero.policy = T)
+
+LISA <- function(x) {
+  P = localmoran(estados$tasa_muertos, listw = ww, zero.policy = T)
+  dif =estados$tasa_muertos - mean(estados$tasa_muertos)
+  lag = lag.listw(ww, estados$tasa_muertos, zero.policy = T) # Calcula el retardo (promedios)
+  clag = dif - mean(lag) # Retardo - Media(Retardo)
+  p = P[,5] # Toma la columna: Pr(z > 0) de P
+  
+  # Se inicializa vector numerico de longitud filas de P
+  quadrant = vector(mode="numeric",length=nrow(P))+5
+  quadrant[dif>0 & clag>0 & p<= 0.05] = 1 
+  quadrant[dif<0 & clag<0 & p<= 0.05] = 2 
+  quadrant[dif<0 & clag>0 & p<= 0.05] = 3 
+  quadrant[dif>0 & clag<0 & p<= 0.05] = 4 
+  
+  # Grafico  
+  brks = c(1,2,3,4,5)
+  colors = c("red", "blue", "lightgreen", "pink", "white")
+  plot(estados$geometry, border ="black", col=colors[findInterval(quadrant,brks,all.inside=FALSE)])
+  legend("bottomright", legend = c("Alto-Alto", "Bajo-Bajo", "Bajo-Alto", "Alto-Bajo", "Insignificante"),fill = colors, bty="n", cex=0.7,x = 2200000, y = 41,y.intersp=1, x.intersp=1)
+}
+
+LISA(ww)
+
+```
+
+## Autocorrelación global
+
+```{r global}
+cords_no_na <- na.omit(datos[,c("incident_id","n_killed","longitude","latitude")])
+
+
+muestra <- na.omit(cords_no_na)
+coords <- cbind(muestra$longitude, muestra$latitude)
+
+w <- knn2nb(knearneigh(coords, k = 5))
+
+listw <- nb2listw(w)
+moran <- moran.mc(muestra$n_killed, listw,nsim = 100)
+moran$p.value
+moran
+moran.test(muestra$n_killed, listw)
+```
+
+# Modelización
+
+## Modelo de conteo
+```{r conteo}
+vbles_mod <- datos_wide[,c(1,2,3,6,7,15,17,30,31,32,33,37,38,39,40,45)]
+selec <- vbles_mod[,c(4,6,7,10,11,13:16)]
+
+set.seed(123)
+train_index <- sample(nrow(selec),0.7*nrow(selec), replace = F)
+train_data <-selec[train_index,]
+test_data <- selec[-train_index,]
+
+
+train_mat <- 
+  train_data %>% 
+  select(-n_killed)%>%
+  as.matrix() %>%
+  xgb.DMatrix(data = ., label = train_data$n_killed )
+
+test_mat <- 
+  test_data %>% 
+  select(-n_killed)%>%
+  as.matrix() %>% 
+  xgb.DMatrix(data = ., label = test_data$n_killed)
+modelo1 <- xgboost(data = train_mat, objective = "count:poisson",max.depth = 6,eta = 0.3,nrounds = 200, verbose = 0)
+
+importance <- xgb.importance(feature_names = colnames(modelo1), model = modelo1)
+xgb.plot.importance(importance_matrix = importance)
+
+unificado2 <- unify(modelo1,train_data)
+shap_values2 <- treeshap(unificado2,selec[1:100,],verbose = 0, interactions = T)
+#shap_values2$shaps[1:3,]
+plot_contribution(shap_values2, obs = 21) 
+plot_feature_importance(shap_values2, max_vars = 6)
+plot_feature_dependence(shap_values2, "mean_age_victimas",title = "")
+
+plot_interaction(shap_values2,"mean_age_victimas","num_vict")
+plot_interaction(shap_values2,"mean_age_victimas","mean_age_suspects")
+pred_modelo1 <- predict(modelo1, test_mat)
+
+test_data$fitted <- pred_modelo1
+
+test_data$residuals <- test_data$n_killed - test_data$fitted 
+
+
+
+set.seed(1)
+plot(sample(test_data$residuals, 100),ylab = "Residuos",xlab = "")
+
+```
+
+## Modelo de clasificación
+
+```{r clasif}
+datos_clas <- vbles_mod%>%mutate(incidente_mortal = ifelse(vbles_mod$n_killed > 0,1,0))
+datos_clas$incidente_mortal <- as.factor(datos_clas$incidente_mortal)
+summary(datos_clas$incidente_mortal)
+
+datos_class <- datos_clas[,c(6,7,10,11,13:17)]
+
+datos_class <- na.omit(datos_class)
+
+set.seed(123)
+train_index <- createDataPartition(datos_class$incidente_mortal, times = 1, p = 0.7, list = FALSE)
+
+train_set <- datos_class[train_index, ] 
+
+test_set <- datos_class[-train_index, ] 
+```
+
+### Naive bayes
+
+```{r nbayes}
+modelonb <- naive_bayes(incidente_mortal~., data = train_set)
+prednb <- predict(modelonb, test_set)
+cf_nb <- confusionMatrix(prednb, reference = test_set$incidente_mortal, positive = "1")
+roc_curve_nb <- roc(test_set$incidente_mortal,as.numeric(prednb))
+auc_value_nb <- auc(roc_curve_nb)
+```
+
+### Logit
+
+```{r logit}
+modelo <- glm(incidente_mortal~., family = binomial,
+              data = train_set)
+logit1_data <- augment(modelo, newdata = test_set, type.predict = "response")
+
+logit1_data1 <- logit1_data %>%mutate(Prediccion = if_else(.fitted > 0.6, 1, 0))
+logit1_data1$Prediccion <- as.factor(logit1_data1$Prediccion)
+cf_logit <- confusionMatrix(logit1_data1$Prediccion, reference = test_set$incidente_mortal, positive = "1")
+roc_curvelogit <- roc(test_set$incidente_mortal,as.numeric(logit1_data1$Prediccion))
+auc_valuelogit <- auc(roc_curvelogit)
+```
+
+### Random Forest
+
+```{r rf}
+set.seed(123)
+rf <- randomForest(incidente_mortal~., data=train_set, ntree = 50, importance = T)
+
+p1 <- predict(rf, test_set)
+cf_rf <- confusionMatrix(p1, test_set$incidente_mortal, positive = "1")
+roc_curverf <- roc(test_set$incidente_mortal,as.numeric(p1))
+auc_valuerf <- auc(roc_curverf)
+```
+
+### Extreme Gradient Boosting
+```{r xgb_ini}
+datos_boost2 <- datos_class
+
+datos_boost2$incidente_mortal <- datos_boost2$incidente_mortal%>%
+  as.factor() %>% 
+  as.numeric %>% 
+  { . - 1 }
+
+
+set.seed(123)
+train_index2 <- createDataPartition(datos_boost2$incidente_mortal, times = 1, p = 0.7, list = FALSE)
+
+train_set2 <- datos_boost2[train_index, ] 
+
+test_set2 <- datos_boost2[-train_index, ] 
+
+
+resultado2 <- list()
+
+resultado2$datos_boost <- datos_boost2
+
+resultado2$train_df <- train_set2
+resultado2$test_df <- test_set2
+
+
+resultado2$train_mat <- 
+  resultado2$train_df %>% 
+  select(-incidente_mortal) %>% 
+  as.matrix() %>% 
+  xgb.DMatrix(data = ., label = resultado2$train_df$incidente_mortal)
+
+resultado2$test_mat <- 
+  resultado2$test_df %>% 
+  select(-incidente_mortal) %>% 
+  as.matrix() %>% 
+  xgb.DMatrix(data = ., label = resultado2$test_df$incidente_mortal)
+
+
+resultado2$modelo_02 <- xgboost(data = resultado2$train_mat, 
+                                objective = "binary:logistic",
+                                nrounds = 100, max.depth = 4, eta = 0.3, nthread = 2, 
+                                early_stopping_rounds = 10, eval_metric = 'auc')
+
+resultado2$predict_02 <- predict(resultado2$modelo_02, resultado2$test_mat)
+
+matriz_conf<- cbind(resultado2$predict_02 > 0.5, resultado2$test_df$incidente_mortal) %>% 
+  data.frame() %>% 
+  table() %>% 
+  confusionMatrix(positive = "1") 
+matriz_conf
+
+roc_curve_xgb <- roc(resultado2$test_df$incidente_mortal,resultado2$predict_02)
+
+auc_value_xgb <- auc(roc_curve_xgb)
+```
+
+### Comparación de modelos
+
+```{r compar}
+modelos_clas <- data.frame(Modelo = character(),Precisión = character(), Sensibilidad = character(), Especificidad = character(),AUC = character())
+
+
+medidas_nb <- c("Naive Bayes",
+                paste0(round(cf_nb[["overall"]][["Accuracy"]]*100,0),"%"),
+                paste0(round(cf_nb[["byClass"]][["Sensitivity"]]*100,0),"%"),
+                paste0(round(cf_nb[["byClass"]][["Specificity"]]*100,0),"%"),
+                round(auc_value_nb,2))
+modelos_clas <- rbind (modelos_clas,medidas_nb)
+
+medidas_logit <- c("Regresión logística",
+                   paste0(round(cf_logit[["overall"]][["Accuracy"]]*100,0),"%"),
+                   paste0(round(cf_logit[["byClass"]][["Sensitivity"]]*100,0),"%"),
+                   paste0(round(cf_logit[["byClass"]][["Specificity"]]*100,0),"%"),
+                   round(auc_valuelogit,2))
+modelos_clas <- rbind(modelos_clas, medidas_logit)
+
+medidas_rf <- c("Random Forest",
+                paste0(round(cf_rf[["overall"]][["Accuracy"]]*100,0),"%"),
+                paste0(round(cf_rf[["byClass"]][["Sensitivity"]]*100,0),"%"),
+                paste0(round(cf_rf[["byClass"]][["Specificity"]]*100,0),"%"),
+                round(auc_valuerf,2))
+
+modelos_clas <- rbind(modelos_clas, medidas_rf)
+
+medidas_xgb <- c("Extreme Gradient Boosting",
+                 paste0(round(matriz_conf[["overall"]][["Accuracy"]]*100,0),"%"),
+                 paste0(round(matriz_conf[["byClass"]][["Sensitivity"]]*100,0),"%"),
+                 paste0(round(matriz_conf[["byClass"]][["Specificity"]]*100,0),"%"),
+                 round(auc_value_xgb2,2))
+
+modelos_clas <- rbind(modelos_clas, medidas_xgb)
+
+colnames(modelos_clas) <- c("Modelo","Precisión","Sensibilidad","Especificidad","AUC")
+
+modelos_clas
+t(modelos_clas)
+
+library(flextable)
+library(officer)
+tabla_comp <- flextable(modelos_clas)
+
+
+theme_flextable <- function(x){
+  x  %>%
+    bg(part = "header", bg = "darkblue")%>%     
+    color(part = "header", color = "white") %>% 
+    hline(part = "body", border = fp_border(color = "black", width = 1))%>%
+    vline(part = "body", border = fp_border(color = "black", width = 1))%>%
+    bold(part = "header", bold = TRUE) %>%         
+    align(align = "center", part = "header") %>%  #Alineamiento del texto
+    align(align = "center", part = "body") %>%
+    align(align = "center", part = "footer")%>%
+    set_table_properties(align = "left", layout = "autofit") 
+}
+
+tabla_comp <- theme_flextable(tabla_comp)
+tabla_comp
+
+```
+
+## Modelo final (clasificación)
+
+```{r xgb_final}
+datos_boost <- datos_clas[,c(6,7,10,11,13:17)]
+
+datos_boost$incidente_mortal <- datos_boost$incidente_mortal%>%
+  as.factor() %>% 
+  as.numeric %>% 
+  { . - 1 }
+
+resultado <- list()
+
+resultado$datos_boost <- datos_boost
+
+set.seed(123)
+resultado$train_df <- sample_frac(datos_boost, size = 0.7)
+
+resultado$test_df <- setdiff(resultado$datos_boost, resultado$train_df)
+
+resultado$train_mat <- 
+  resultado$train_df %>% 
+  select(-incidente_mortal) %>% 
+  as.matrix() %>% 
+  xgb.DMatrix(data = ., label = resultado$train_df$incidente_mortal)
+
+resultado$test_mat <- 
+  resultado$test_df %>% 
+  select(-incidente_mortal) %>% 
+  as.matrix() %>% 
+  xgb.DMatrix(data = ., label = resultado$test_df$incidente_mortal)
+
+
+resultado$modelo_02 <- xgboost(data = resultado$train_mat, 
+                               objective = "binary:logistic",
+                               nrounds = 200, max.depth = 4, eta = 0.3, nthread = 2, 
+                               early_stopping_rounds = 10, eval_metric = 'auc', verbose = 0)
+
+
+resultado$predict_02 <- predict(resultado$modelo_02, resultado$test_mat)
+
+matriz_conf2<- cbind(resultado$predict_02 > 0.35, resultado$test_df$incidente_mortal) %>% 
+  data.frame() %>% 
+  table() %>% 
+  confusionMatrix(positive = "1") 
+
+matriz_conf2
+
+resultado$predicted <- cbind(data.frame(class_preds=resultado$predict_02), resultado$test_df)
+resultado$predicted$class_preds <- as.factor(ifelse(resultado$predicted$class_preds > 0.35,1,0))
+resultado$predicted$incidente_mortal <- as.factor(resultado$predicted$incidente_mortal)
+
+ConfusionTableR::binary_visualiseR(train_labels = resultado$predicted$class_preds,
+                                   truth_labels= resultado$predicted$incidente_mortal,
+                                   class_label1 = "No mortal", 
+                                   class_label2 = "Mortal",
+                                   quadrant_col1 = "#28ACB4", 
+                                   quadrant_col2 = "#4397D2", 
+                                   custom_title = "", 
+                                   text_col= "black",
+                                   info_box_title = "")
+
+
+roc_curve_xgb <- roc(resultado$test_df$incidente_mortal,resultado$predict_02)
+
+auc_value_xgb <- auc(roc_curve_xgb)
+
+
+
+matriz_conf2
+plot(roc_curve_xgb, col = "blue",ylab = "Sensibilidad",xlab = "Especificidad")
+text(0.62,0.6, paste("AUC =", round(auc_value_xgb,2)),col = "black")
+
+importance <- xgb.importance(feature_names = colnames(resultado$modelo_02), model = resultado$modelo_02)
+xgb.plot.importance(importance_matrix = importance)
+
+
+sorted_importance <- importance[order(importance$Feature),]
+
+unificado <- unify(resultado$modelo_02,resultado$datos_boost)
+shap_values <- treeshap(unificado,resultado$datos_boost[1:100,],verbose = 0)
+shap_values$shaps[1:3, 1:6]
+
+
+plot_contribution(shap_values, obs = 21)
+plot_feature_importance(shap_values, max_vars = 6)
+
+```
+
